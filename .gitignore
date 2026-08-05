@@ -1,0 +1,14 @@
+# ESP-IDF build artifacts
+build/
+
+# CMake-generated files (if generated at root in other workflows)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Editor/OS noise
+.vscode/
+*.swp
+*.swo
+.DS_Store
