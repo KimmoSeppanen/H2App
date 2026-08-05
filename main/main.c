@@ -13,14 +13,25 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
-static const char *TAG = "MAIN_APP";
+static const char *TAG __attribute__((unused)) = "MAIN_APP";
+
+#define APP_VERSION             "0.5.0"
+
+#define CHANGELOG_LATEST_1      "0.5.0: Startup now prints last 3 changelog entries"
+#define CHANGELOG_LATEST_2      "0.4.0: Olimex LED control fixed (GPIO8 active LOW)"
+#define CHANGELOG_LATEST_3      "0.3.0: Added button/calibration status LED behavior"
 
 // ============================================================================
 // 1. HARDWARE PINS & ADC CONFIGURATION
 // ============================================================================
 #define BUTTON_GPIO             GPIO_NUM_9          // Onboard BOOT button
+#define RGB_LED_GPIO            GPIO_NUM_8          // Onboard user LED (single color)
+#define BUTTON_ACTIVE_LEVEL     0                   // Olimex BOOT button is active LOW
 #define BUTTON_DEBOUNCE_MS      50                  // Resonant bounce filter time
 #define BUTTON_HOLD_TIME_MS     5000                // 5-second long-press threshold
+
+#define USER_LED_ON_LEVEL       0                   // Onboard LED is active LOW
+#define USER_LED_OFF_LEVEL      1
 
 #define BATTERY_ADC_CHANNEL     ADC_CHANNEL_1       // GPIO2 (ADC1 CH1)
 #define SERVO_FB_ADC_CHANNEL    ADC_CHANNEL_3       // GPIO4 (ADC1 CH3)
@@ -101,7 +112,73 @@ static void read_servo_feedback(int *raw_out, int *mv_out)
 }
 
 // ============================================================================
-// 2. SERVO PWM CONFIGURATION & MOVEMENT HELPERS
+// 2. ONBOARD RGB LED DRIVER & TASK
+// ============================================================================
+typedef enum {
+    LED_STATE_OFF = 0,
+    LED_STATE_GREEN,
+    LED_STATE_FLASH_RED
+} led_state_t;
+
+static volatile led_state_t g_led_state = LED_STATE_OFF;
+static volatile bool g_calibration_active = false;
+
+static inline bool button_is_pressed(void)
+{
+    return gpio_get_level(BUTTON_GPIO) == BUTTON_ACTIVE_LEVEL;
+}
+
+static void status_led_init(void)
+{
+    gpio_config_t led_conf = {
+        .pin_bit_mask = (1ULL << RGB_LED_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&led_conf));
+    ESP_ERROR_CHECK(gpio_set_level(RGB_LED_GPIO, USER_LED_OFF_LEVEL));
+}
+
+static void set_rgb_led(uint8_t r, uint8_t g, uint8_t b)
+{
+    bool led_on = (r != 0) || (g != 0) || (b != 0);
+    ESP_ERROR_CHECK(gpio_set_level(RGB_LED_GPIO, led_on ? USER_LED_ON_LEVEL : USER_LED_OFF_LEVEL));
+}
+
+static void led_task(void *pvParameters)
+{
+    bool flash_toggle = false;
+
+    while (1) {
+        switch (g_led_state) {
+            case LED_STATE_GREEN:
+                set_rgb_led(0, 255, 0); // Solid Green on press
+                vTaskDelay(pdMS_TO_TICKS(50));
+                break;
+
+            case LED_STATE_FLASH_RED:
+                flash_toggle = !flash_toggle;
+                if (flash_toggle) {
+                    set_rgb_led(255, 0, 0); // Red ON
+                } else {
+                    set_rgb_led(0, 0, 0);   // Red OFF
+                }
+                vTaskDelay(pdMS_TO_TICKS(250)); // Flash rate
+                break;
+
+            case LED_STATE_OFF:
+            default:
+                set_rgb_led(0, 0, 0);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                break;
+        }
+    }
+}
+
+// ============================================================================
+// 3. SERVO PWM CONFIGURATION & MOVEMENT HELPERS
 // ============================================================================
 #define SERVO_GPIO              GPIO_NUM_3
 #define SERVO_LEDC_SPEED_MODE   LEDC_LOW_SPEED_MODE
@@ -116,7 +193,7 @@ static void read_servo_feedback(int *raw_out, int *mv_out)
 
 static int Calibration_Sensitivity     = 50;  // Range: 1 (sensitive) to 100 (stall only)
 static int Calibration_Step_Size       = 5;   // Degrees per step (1 to 45)
-static int Calibration_Backoff_Degrees = 20;  // Safe margin backed off after stall confirmed (0 to 45)
+static int Calibration_Backoff_Degrees = 5;   // Safe margin backed off after stall confirmed (0 to 45)
 
 static int calib_min_angle = 0;
 static int calib_max_angle = SERVO_MAX_DEGREE;
@@ -206,10 +283,17 @@ static int calculate_stop_threshold(int ref_delta, int sensitivity)
 }
 
 // ============================================================================
-// 3. STEP-BASED CALIBRATION & BACKOFF ROUTINE
+// 4. STEP-BASED CALIBRATION & BACKOFF ROUTINE
 // ============================================================================
 static void calibrate_servo(void)
 {
+    if (g_calibration_active) {
+        return;
+    }
+
+    g_calibration_active = true;
+    g_led_state = LED_STATE_FLASH_RED;
+
     printf("\n--- Starting Servo Calibration ---\n");
     printf("Config: Sensitivity = %d/100 | Step Size = %d deg | Backoff Margin = %d deg\n", 
            Calibration_Sensitivity, Calibration_Step_Size, Calibration_Backoff_Degrees);
@@ -406,10 +490,13 @@ static void calibrate_servo(void)
     set_servo_angle(135);
     printf("\n--- Calibration Complete ---\n");
     printf("Safe Operating Range: %d to %d degrees\n\n", calib_min_angle, calib_max_angle);
+
+    g_calibration_active = false;
+    g_led_state = LED_STATE_OFF;
 }
 
 // ============================================================================
-// 4. DEBOUNCED BUTTON TASK (SHORT PRESS CYCLE + LONG PRESS CALIBRATION)
+// 5. DEBOUNCED BUTTON TASK
 // ============================================================================
 static void button_task(void *pvParameters)
 {
@@ -422,27 +509,36 @@ static void button_task(void *pvParameters)
     };
     gpio_config(&io_conf);
 
-    bool is_pressed = false;
+    // Track the initial button level so we only react on subsequent edges.
+    bool is_pressed = button_is_pressed();
     bool triggered = false;
     TickType_t press_start_time = 0;
     int last_printed_sec = 0;
 
-    // Preset percentages for short press cycling (0% -> 50% -> 100% -> 50% -> 0%)
     static const int cycle_pcts[] = {0, 50, 100, 50};
     static const int num_cycle_steps = sizeof(cycle_pcts) / sizeof(cycle_pcts[0]);
     static int cycle_idx = 0;
 
+    printf("[Button] Startup level=%d, active_level=%d\n", gpio_get_level(BUTTON_GPIO), BUTTON_ACTIVE_LEVEL);
+
+    // Enforce known idle state at task start.
+    if (!g_calibration_active) {
+        g_led_state = LED_STATE_OFF;
+    }
+
     while (1) {
-        // Active LOW: Pressed = 0, Released = 1
-        if (gpio_get_level(BUTTON_GPIO) == 0) {
+        if (button_is_pressed()) {
             if (!is_pressed) {
-                // Filter resonance bounce with 50ms verification delay
                 vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-                if (gpio_get_level(BUTTON_GPIO) == 0) {
+                if (button_is_pressed()) {
                     is_pressed = true;
                     triggered = false;
                     press_start_time = xTaskGetTickCount();
                     last_printed_sec = 0;
+
+                    if (!g_calibration_active) {
+                        g_led_state = LED_STATE_GREEN;
+                    }
                 }
             } else if (!triggered) {
                 uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - press_start_time);
@@ -458,14 +554,20 @@ static void button_task(void *pvParameters)
                     printf("\n[Button] 5-second long press confirmed! Triggering calibration...\n");
                     calibrate_servo();
                 }
+            } else {
+                if (!g_calibration_active) {
+                    g_led_state = LED_STATE_GREEN;
+                }
             }
         } else {
             if (is_pressed) {
-                // Filter release bounce
                 vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-                if (gpio_get_level(BUTTON_GPIO) == 1) {
+                if (!button_is_pressed()) {
+                    if (!g_calibration_active) {
+                        g_led_state = LED_STATE_OFF;
+                    }
+
                     if (!triggered) {
-                        // Short Press Handler: Cycle 0% -> 50% -> 100% -> 50% -> 0%
                         int target_pct = cycle_pcts[cycle_idx];
                         cycle_idx = (cycle_idx + 1) % num_cycle_steps;
 
@@ -482,7 +584,7 @@ static void button_task(void *pvParameters)
 }
 
 // ============================================================================
-// 5. COMMAND PROCESSOR & MAIN LOOP
+// 6. COMMAND PROCESSOR & MAIN LOOP
 // ============================================================================
 static void process_command(const char *cmd)
 {
@@ -564,13 +666,19 @@ static void process_command(const char *cmd)
 void app_main(void)
 {
     adc_init();
+    status_led_init();
     servo_init();
     set_servo_angle(135);
 
-    // Spawn debounced BOOT button monitor task
+    // Spawn background tasks
+    xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
 
-    printf("\n=== ESP32-H2 Interactive Controller Ready ===\n");
+    printf("\n=== ESP32-H2 Interactive Controller v%s ===\n", APP_VERSION);
+    printf("Recent changes:\n");
+    printf("  - %s\n", CHANGELOG_LATEST_1);
+    printf("  - %s\n", CHANGELOG_LATEST_2);
+    printf("  - %s\n", CHANGELOG_LATEST_3);
     printf("Commands:\n");
     printf("  1. 'Battery'             -> Returns battery voltage\n");
     printf("  2. 'Servo nnn' or 'nnn%%' -> Sets servo angle in deg or relative %%\n");
@@ -579,7 +687,7 @@ void app_main(void)
     printf("  5. 'StepSize [1-45]'     -> Gets or sets calibration step size (deg)\n");
     printf("  6. 'Backoff [0-45]'      -> Gets or sets safe backoff margin (deg)\n");
     printf("  7. [BOOT Button]         -> Short press: cycles 0%% -> 50%% -> 100%% -> 50%% -> 0%%\n");
-    printf("                              Long press (5s): runs calibration\n\n");
+    printf("                              Long press (5s): runs calibration (Flashing Red LED)\n\n");
 
     static char line_buf[128];
     static size_t line_pos = 0;

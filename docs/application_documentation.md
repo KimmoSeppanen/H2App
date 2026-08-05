@@ -1,290 +1,699 @@
-# Application Documentation: h2_app
-
-## 1. Purpose
-
-`h2_app` is an ESP32-H2 firmware application that combines:
-- Servo motion control using LEDC PWM
-- Servo position/response feedback sampling through ADC
-- Battery voltage measurement through ADC and external divider
-- Interactive runtime control over UART commands
-- On-device calibration of servo safe operating limits
-- BOOT button short-press and long-press interaction model
-
-The implementation is in `main/main.c`.
-
-## 2. Build and Runtime Environment
-
-- Framework: ESP-IDF
-- Language: C
-- Main entry: `app_main()`
-- RTOS: FreeRTOS (task for button handling + foreground command loop)
-
-### Required Components
-
-Declared in `main/CMakeLists.txt`:
-- `driver`
-- `esp_adc`
-
-### Project CMake Root
-
-Root `CMakeLists.txt` declares the project using standard ESP-IDF boilerplate.
-
-## 3. Hardware Interface
-
-### GPIO and ADC Mapping
-
-- BOOT button: `GPIO9` (input, pull-up enabled, active low)
-- Servo PWM output: `GPIO3`
-- Battery ADC channel: `ADC1 CH1` (GPIO2)
-- Servo feedback ADC channel: `ADC1 CH3` (GPIO4)
-
-### ADC Configuration
-
-- ADC unit: `ADC_UNIT_1`
-- Attenuation: `ADC_ATTEN_DB_12` for both battery and servo feedback channels
-- Bit width: `ADC_BITWIDTH_DEFAULT`
-- Calibration: curve fitting scheme on ESP32-H2 when available
-
-### Electrical Conversion
-
-Battery voltage conversion assumes:
-- ADC pin measures divided voltage
-- Voltage divider ratio: `5.7`
-
-So:
-- `battery_voltage = pin_voltage * 5.7`
-
-## 4. Software Architecture
-
-The code in `main/main.c` is organized into five major sections:
-
-1. Hardware pins and ADC setup
-2. Servo PWM setup and movement helpers
-3. Step-based calibration and backoff routine
-4. Debounced BOOT button task
-5. Command processor and main loop
-
-### Runtime Concurrency Model
-
-- Task 1: `button_task`
-  - Monitors BOOT button with debounce and hold detection
-  - Dispatches short-press servo cycle or long-press calibration
-- Task 2: `app_main` loop
-  - Reads UART characters with `getchar()`
-  - Builds command lines
-  - Executes parsed commands
-
-No mutexes are currently used; operations are simple and serialized enough for current behavior.
-
-## 5. Servo Control Design
-
-### PWM Parameters
-
-- Frequency: `50 Hz` (20 ms period)
-- Resolution: `14-bit`
-- Pulse width range: `500 us` to `2500 us`
-- Logical max range: `0..270 degrees`
-
-### Angle to PWM Mapping
-
-For angle `a`:
-- pulse width is linearly interpolated between 500 and 2500 us over 0..270 deg
-- duty is scaled from pulse width into 14-bit LEDC duty counts over 20 ms period
-
-### Safe Clamp Limits
-
-Commands are clamped to:
-- `calib_min_angle`
-- `calib_max_angle`
-
-Defaults at boot:
-- min = `0`
-- max = `270`
-
-Calibration can tighten this range.
-
-## 6. ADC Reading and Feedback Sampling
-
-### Battery Reading
-
-`read_battery_voltage()`:
-1. Reads raw sample from battery ADC channel
-2. Uses ADC calibration if available, otherwise raw linear approximation
-3. Converts pin mV to battery V using divider ratio
-
-### Servo Feedback Reading
-
-`read_servo_feedback()`:
-1. Waits 100 ms for analog supply/feedback settling
-2. Collects 32 samples with 100 us spacing
-3. Averages raw samples
-4. Converts to mV using calibration if available
-
-Oversampling smooths noise and improves stall/progress decisions during calibration.
-
-## 7. Calibration Algorithm
-
-`calibrate_servo()` estimates safe mechanical limits by detecting reduced motion progress in feedback voltage.
-
-### Tunable Parameters
-
-- `Calibration_Sensitivity` (1..100), default 50
-- `Calibration_Step_Size` (1..45 deg), default 5
-- `Calibration_Backoff_Degrees` (0..45 deg), default 20
-
-### Threshold Logic
-
-A baseline phase collects 5 small steps and computes average per-step feedback change magnitude (`ref_delta`).
-A stop threshold is then derived from sensitivity:
-- Higher sensitivity value -> lower threshold
-- Lower threshold means earlier stall detection
-
-The threshold is clamped to at least 1 mV-equivalent step progress.
-
-### Direction Polarity Handling
-
-Feedback voltage may increase or decrease with angle depending on wiring/sensor orientation.
-The routine computes effective progress direction (`dir_max` or `dir_min`) so comparisons remain valid independent of polarity.
-
-### Scan Strategy
-
-1. Move to center (135 deg)
-2. Baseline sample in increasing-angle direction
-3. Scan toward max angle in `StepSize` increments
-4. If progress falls below threshold:
-   - mark candidate stall
-   - verify candidate with 3 retries (step away, then return)
-   - if still stalled, confirm hard limit
-   - apply backoff margin to define safe max
-5. Return to center
-6. Repeat equivalent process toward min angle
-7. Apply safe min and safe max
-8. Return to center and print final range
-
-### Why Retry Verification Exists
-
-Single-step anomalies can occur due to noise, compliance, load shifts, or temporary friction.
-The retry loop reduces false positives before locking in safe limits.
-
-## 8. BOOT Button Interaction
-
-`button_task()` behavior:
-
-- Debounce on press: 50 ms
-- Debounce on release: 50 ms
-- Long-press threshold: 5000 ms
-
-### Short Press
-
-Cycles servo target percentages through sequence:
-- 0%
-- 50%
-- 100%
-- 50%
-- then repeats
-
-### Long Press
-
-When hold time reaches 5 seconds:
-- triggers `calibrate_servo()` once
-- release after long press does not execute short-press action
-
-## 9. UART Command Interface
-
-Commands are parsed case-insensitively in `process_command()`.
-
-### Supported Commands
-
-- `Battery`
-- `Calibrate`
-- `Sensitivity [1-100]`
-- `StepSize [1-45]`
-- `Backoff [0-45]`
-- `Servo <nnn>`
-- `Servo <nnn%>`
-
-### Parsing Notes
-
-- Enter accepted on CR or LF
-- Backspace and DEL are handled
-- Command line buffer is 128 bytes
-- Unknown commands print help summary
-
-### Validation Rules
-
-- `Sensitivity`: must be 1..100
-- `StepSize`: must be 1..45
-- `Backoff`: must be 0..45
-- `Servo` percentage is clamped to 0..100
-- Servo degrees are clamped to calibrated safe range when applied
-
-## 10. Startup Sequence
-
-At boot (`app_main()`):
-
-1. Initialize ADC subsystem
-2. Initialize servo PWM subsystem
-3. Set servo to 135 deg
-4. Create button monitor task
-5. Print command help banner
-6. Enter infinite UART command loop
-
-## 11. Timing Characteristics
-
-Key delays in firmware logic:
-
-- Servo settle after movement command: 600 ms
-- Servo feedback pre-read settle: 100 ms
-- Oversample spacing: 100 us
-- Calibration step dwell: 350 ms
-- Centering pauses during calibration: 1000 ms
-- Button polling period: 20 ms
-
-These values balance responsiveness with analog stability and calibration reliability.
-
-## 12. Known Limitations and Risks
-
-- Calibration depends on feedback sensor quality and monotonicity.
-- No persistent storage of calibrated limits; limits reset after reboot.
-- Servo calibration and command handling can overlap conceptually (two contexts), though current logic is straightforward and generally safe for this use case.
-- No explicit watchdog/timeout around calibration phases.
-
-## 13. Suggested Enhancements
-
-- Store calibration results in NVS and restore on boot
-- Add command to print current calibrated range
-- Add command to dump raw ADC streams for diagnostics
-- Add optional moving-average filter for runtime servo feedback
-- Add explicit state machine to block overlapping motion/calibration actions
-- Add unit-level tests for parser and threshold calculation logic (host-side)
-
-## 14. Troubleshooting
-
-### Servo does not move
-
-- Confirm servo power and ground are correct and shared with board ground.
-- Verify PWM line is connected to GPIO3.
-- Check command syntax with `Servo 90` or `Servo 50%`.
-
-### Calibration detects limits too early
-
-- Increase `Sensitivity` value gradually and retry calibration.
-- Decrease `StepSize` for finer detection.
-- Ensure feedback line on GPIO4 is stable and not noisy.
-
-### Calibration misses hard stop
-
-- Decrease `Sensitivity` value.
-- Increase `StepSize` slightly if changes are too small to detect.
-
-### Battery voltage seems wrong
-
-- Verify external resistor divider ratio matches firmware value `5.7`.
-- Confirm battery input is connected to GPIO2 / ADC1 CH1.
-
-## 15. Reference Files
-
-- `main/main.c`: full application implementation
-- `main/CMakeLists.txt`: component registration and dependencies
-- `CMakeLists.txt`: top-level ESP-IDF project declaration
-- `README.md`: quickstart and operator-facing usage
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "led_strip.h"
+
+static const char *TAG = "MAIN_APP";
+
+// ============================================================================
+// 1. HARDWARE PINS & ADC CONFIGURATION
+// ============================================================================
+#define BUTTON_GPIO             GPIO_NUM_9          // Onboard BOOT button
+#define RGB_LED_GPIO            GPIO_NUM_8          // Onboard WS2812 RGB LED
+#define BUTTON_DEBOUNCE_MS      50                  // Resonant bounce filter time
+#define BUTTON_HOLD_TIME_MS     5000                // 5-second long-press threshold
+
+#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_1       // GPIO2 (ADC1 CH1)
+#define SERVO_FB_ADC_CHANNEL    ADC_CHANNEL_3       // GPIO4 (ADC1 CH3)
+
+#define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12     // 0-3.3V range
+#define SERVO_FB_ADC_ATTEN      ADC_ATTEN_DB_12     // 0-3.3V range
+
+#define VOLTAGE_DIVIDER_RATIO   5.7f
+#define OVERSAMPLE_COUNT        32
+
+static adc_oneshot_unit_handle_t adc1_handle;
+static adc_cali_handle_t cali_handle_bat = NULL;
+static adc_cali_handle_t cali_handle_fb = NULL;
+
+static void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config_bat = {
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BATTERY_ADC_CHANNEL, &config_bat));
+
+    adc_oneshot_chan_cfg_t config_fb = {
+        .atten = SERVO_FB_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, SERVO_FB_ADC_CHANNEL, &config_fb));
+
+#if CONFIG_IDF_TARGET_ESP32H2
+    adc_cali_curve_fitting_config_t cali_config_bat = {
+        .unit_id = ADC_UNIT_1, .chan = BATTERY_ADC_CHANNEL, .atten = BATTERY_ADC_ATTEN, .bitwidth = ADC_BITWIDTH_DEFAULT
+    };
+    adc_cali_create_scheme_curve_fitting(&cali_config_bat, &cali_handle_bat);
+
+    adc_cali_curve_fitting_config_t cali_config_fb = {
+        .unit_id = ADC_UNIT_1, .chan = SERVO_FB_ADC_CHANNEL, .atten = SERVO_FB_ADC_ATTEN, .bitwidth = ADC_BITWIDTH_DEFAULT
+    };
+    adc_cali_create_scheme_curve_fitting(&cali_config_fb, &cali_handle_fb);
+#endif
+}
+
+static float read_battery_voltage(void)
+{
+    int raw_val = 0, pin_voltage_mv = 0;
+    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_ADC_CHANNEL, &raw_val));
+    if (cali_handle_bat) {
+        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle_bat, raw_val, &pin_voltage_mv));
+    } else {
+        pin_voltage_mv = (raw_val * 3300) / 4095;
+    }
+    return (pin_voltage_mv * VOLTAGE_DIVIDER_RATIO) / 1000.0f;
+}
+
+static void read_servo_feedback(int *raw_out, int *mv_out)
+{
+    vTaskDelay(pdMS_TO_TICKS(100)); // Supply settling delay
+
+    uint32_t raw_sum = 0;
+    int single_raw = 0;
+    for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, SERVO_FB_ADC_CHANNEL, &single_raw));
+        raw_sum += single_raw;
+        esp_rom_delay_us(100);
+    }
+    int avg_raw = raw_sum / OVERSAMPLE_COUNT;
+    int voltage_mv = 0;
+
+    if (cali_handle_fb) {
+        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle_fb, avg_raw, &voltage_mv));
+    } else {
+        voltage_mv = (avg_raw * 3300) / 4095;
+    }
+    *raw_out = avg_raw;
+    *mv_out = voltage_mv;
+}
+
+// ============================================================================
+// 2. ONBOARD RGB LED DRIVER & TASK
+// ============================================================================
+typedef enum {
+    LED_STATE_OFF = 0,
+    LED_STATE_GREEN,
+    LED_STATE_FLASH_RED
+} led_state_t;
+
+static volatile led_state_t g_led_state = LED_STATE_OFF;
+static led_strip_handle_t led_strip_handle;
+
+static void rgb_led_init(void)
+{
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = RGB_LED_GPIO,
+        .max_leds = 1,
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip_handle));
+    led_strip_clear(led_strip_handle);
+}
+
+static void set_rgb_led(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (led_strip_handle) {
+        if (r == 0 && g == 0 && b == 0) {
+            led_strip_clear(led_strip_handle);
+        } else {
+            led_strip_set_pixel(led_strip_handle, 0, r, g, b);
+            led_strip_refresh(led_strip_handle);
+        }
+    }
+}
+
+static void led_task(void *pvParameters)
+{
+    bool flash_toggle = false;
+
+    while (1) {
+        switch (g_led_state) {
+            case LED_STATE_GREEN:
+                set_rgb_led(0, 255, 0); // Solid Green on press
+                vTaskDelay(pdMS_TO_TICKS(50));
+                break;
+
+            case LED_STATE_FLASH_RED:
+                flash_toggle = !flash_toggle;
+                if (flash_toggle) {
+                    set_rgb_led(255, 0, 0); // Red ON
+                } else {
+                    set_rgb_led(0, 0, 0);   // Red OFF
+                }
+                vTaskDelay(pdMS_TO_TICKS(250)); // Flash rate
+                break;
+
+            case LED_STATE_OFF:
+            default:
+                set_rgb_led(0, 0, 0);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                break;
+        }
+    }
+}
+
+// ============================================================================
+// 3. SERVO PWM CONFIGURATION & MOVEMENT HELPERS
+// ============================================================================
+#define SERVO_GPIO              GPIO_NUM_3
+#define SERVO_LEDC_SPEED_MODE   LEDC_LOW_SPEED_MODE
+#define SERVO_LEDC_CHANNEL      LEDC_CHANNEL_0
+#define SERVO_LEDC_TIMER        LEDC_TIMER_0
+#define SERVO_LEDC_DUTY_RES     LEDC_TIMER_14_BIT
+#define SERVO_LEDC_FREQ_HZ      50
+
+#define SERVO_MIN_PULSE_WIDTH_US 500
+#define SERVO_MAX_PULSE_WIDTH_US 2500
+#define SERVO_MAX_DEGREE         270
+
+static int Calibration_Sensitivity     = 50;  // Range: 1 (sensitive) to 100 (stall only)
+static int Calibration_Step_Size       = 5;   // Degrees per step (1 to 45)
+static int Calibration_Backoff_Degrees = 5;   // Safe margin backed off after stall confirmed (0 to 45)
+
+static int calib_min_angle = 0;
+static int calib_max_angle = SERVO_MAX_DEGREE;
+
+static void servo_init(void)
+{
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = SERVO_LEDC_SPEED_MODE,
+        .timer_num        = SERVO_LEDC_TIMER,
+        .duty_resolution  = SERVO_LEDC_DUTY_RES,
+        .freq_hz          = SERVO_LEDC_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = SERVO_LEDC_SPEED_MODE,
+        .channel        = SERVO_LEDC_CHANNEL,
+        .timer_sel      = SERVO_LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = SERVO_GPIO,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
+
+static void set_servo_angle(int angle)
+{
+    if (angle < calib_min_angle) angle = calib_min_angle;
+    if (angle > calib_max_angle) angle = calib_max_angle;
+
+    uint32_t pulse_width_us = SERVO_MIN_PULSE_WIDTH_US + 
+        (((uint32_t)angle * (SERVO_MAX_PULSE_WIDTH_US - SERVO_MIN_PULSE_WIDTH_US)) / SERVO_MAX_DEGREE);
+
+    uint32_t max_duty = (1 << 14) - 1;
+    uint32_t duty = (pulse_width_us * max_duty) / 20000;
+
+    ESP_ERROR_CHECK(ledc_set_duty(SERVO_LEDC_SPEED_MODE, SERVO_LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(SERVO_LEDC_SPEED_MODE, SERVO_LEDC_CHANNEL));
+}
+
+static void move_servo_degrees(int target_angle)
+{
+    int clamped_angle = target_angle;
+    if (clamped_angle < calib_min_angle) clamped_angle = calib_min_angle;
+    if (clamped_angle > calib_max_angle) clamped_angle = calib_max_angle;
+
+    set_servo_angle(target_angle);
+    vTaskDelay(pdMS_TO_TICKS(600));
+
+    int raw_fb, mv_fb;
+    read_servo_feedback(&raw_fb, &mv_fb);
+
+    if (target_angle != clamped_angle) {
+        printf("Warning: Target %d deg clamped to safe limit %d deg.\n", target_angle, clamped_angle);
+    }
+    printf("Servo turned to %d deg | Feedback: %d mV (ADC Raw: %d)\n", clamped_angle, mv_fb, raw_fb);
+}
+
+static void move_servo_percentage(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    float span = (float)(calib_max_angle - calib_min_angle);
+    int clamped_angle = (int)(calib_min_angle + roundf((pct / 100.0f) * span));
+
+    set_servo_angle(clamped_angle);
+    vTaskDelay(pdMS_TO_TICKS(600));
+
+    int raw_fb, mv_fb;
+    read_servo_feedback(&raw_fb, &mv_fb);
+
+    printf("Servo turned to %d%% (%d deg) [Limits: %d..%d deg] | Feedback: %d mV (ADC Raw: %d)\n",
+           pct, clamped_angle, calib_min_angle, calib_max_angle, mv_fb, raw_fb);
+}
+
+static int calculate_stop_threshold(int ref_delta, int sensitivity)
+{
+    if (sensitivity >= 100) return 1;
+
+    float factor = 0.80f - ((float)(sensitivity - 1) * (0.75f / 98.0f));
+    int threshold = (int)(ref_delta * factor);
+
+    return (threshold > 1) ? threshold : 1;
+}
+
+// ============================================================================
+// 4. STEP-BASED CALIBRATION & BACKOFF ROUTINE
+// ============================================================================
+static void calibrate_servo(void)
+{
+    // Start LED Flashing Red
+    g_led_state = LED_STATE_FLASH_RED;
+
+    printf("\n--- Starting Servo Calibration ---\n");
+    printf("Config: Sensitivity = %d/100 | Step Size = %d deg | Backoff Margin = %d deg\n", 
+           Calibration_Sensitivity, Calibration_Step_Size, Calibration_Backoff_Degrees);
+
+    calib_min_angle = 0;
+    calib_max_angle = SERVO_MAX_DEGREE;
+
+    int raw_fb, mv_fb, prev_mv;
+
+    // --- SCAN MAX LIMIT ---
+    printf("\n1. Moving to center (135 deg)...\n");
+    set_servo_angle(135);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    read_servo_feedback(&raw_fb, &mv_fb);
+    prev_mv = mv_fb;
+
+    printf("2. Sampling 5 baseline steps (+%d deg) on GPIO4...\n", Calibration_Step_Size);
+    int baseline_sum_progress = 0;
+    int curr_ang = 135;
+
+    for (int i = 0; i < 5; i++) {
+        int next_ang = curr_ang + Calibration_Step_Size;
+        if (next_ang > SERVO_MAX_DEGREE) break;
+
+        set_servo_angle(next_ang);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        read_servo_feedback(&raw_fb, &mv_fb);
+
+        baseline_sum_progress += (mv_fb - prev_mv);
+        printf("  [Baseline %d/5 @ %3d deg] FB: %4d mV | Step Change: %+d mV\n", i + 1, next_ang, mv_fb, mv_fb - prev_mv);
+        prev_mv = mv_fb;
+        curr_ang = next_ang;
+    }
+
+    int dir_max = (baseline_sum_progress >= 0) ? 1 : -1;
+    int ref_delta = abs(baseline_sum_progress) / 5;
+    if (ref_delta < 2) ref_delta = 2;
+    int thresh = calculate_stop_threshold(ref_delta, Calibration_Sensitivity);
+
+    printf("  -> Polarity: %s | Avg Step: %d mV | Stop Thresh: <= %d mV\n",
+           (dir_max > 0) ? "Positive (+mV)" : "Negative (-mV)", ref_delta, thresh);
+    printf("3. Scanning for MAX limit...\n");
+
+    for (int ang = curr_ang + Calibration_Step_Size; ang <= SERVO_MAX_DEGREE; ang += Calibration_Step_Size) {
+        set_servo_angle(ang);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        read_servo_feedback(&raw_fb, &mv_fb);
+
+        int progress = dir_max * (mv_fb - prev_mv);
+        printf("  [Angle %3d] FB: %4d mV | Forward Progress: %+2d mV\n", ang, mv_fb, progress);
+
+        if (progress <= thresh) {
+            int pre_stall_ang = ang - Calibration_Step_Size;
+            if (pre_stall_ang < 0) pre_stall_ang = 0;
+
+            printf("  -> Candidate stall detected at %d deg (Progress %+d <= Thresh %d).\n", ang, progress, thresh);
+            printf("  -> Verifying stall at %d deg by stepping back %d deg to %d deg (3 retries)...\n", 
+                   ang, Calibration_Step_Size, pre_stall_ang);
+
+            bool is_real_stall = true;
+
+            for (int retry = 1; retry <= 3; retry++) {
+                set_servo_angle(pre_stall_ang);
+                vTaskDelay(pdMS_TO_TICKS(350));
+                read_servo_feedback(&raw_fb, &mv_fb);
+                int pre_mv = mv_fb;
+
+                set_servo_angle(ang);
+                vTaskDelay(pdMS_TO_TICKS(350));
+                read_servo_feedback(&raw_fb, &mv_fb);
+
+                int retry_progress = dir_max * (mv_fb - pre_mv);
+                printf("     [Retry %d/3 @ %3d deg] Progress from %d deg: %+2d mV\n", retry, ang, pre_stall_ang, retry_progress);
+
+                if (retry_progress > thresh) {
+                    printf("     -> Motion restored! False alarm cleared.\n");
+                    is_real_stall = false;
+                    prev_mv = mv_fb;
+                    break;
+                }
+            }
+
+            if (is_real_stall) {
+                int final_limit = ang - Calibration_Backoff_Degrees;
+                if (final_limit < 0) final_limit = 0;
+
+                printf("  -> Hard limit confirmed at %d deg! Backing off %d deg to safe limit: %d deg.\n", 
+                       ang, Calibration_Backoff_Degrees, final_limit);
+                calib_max_angle = final_limit;
+                set_servo_angle(final_limit);
+                break;
+            }
+        } else {
+            prev_mv = mv_fb;
+        }
+
+        if (ang + Calibration_Step_Size > SERVO_MAX_DEGREE) {
+            calib_max_angle = SERVO_MAX_DEGREE;
+        }
+    }
+
+    // --- SCAN MIN LIMIT ---
+    printf("\n4. Returning to center (135 deg)...\n");
+    set_servo_angle(135);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    read_servo_feedback(&raw_fb, &mv_fb);
+    prev_mv = mv_fb;
+
+    printf("5. Sampling 5 baseline steps (-%d deg) on GPIO4...\n", Calibration_Step_Size);
+    baseline_sum_progress = 0;
+    curr_ang = 135;
+
+    for (int i = 0; i < 5; i++) {
+        int next_ang = curr_ang - Calibration_Step_Size;
+        if (next_ang < 0) break;
+
+        set_servo_angle(next_ang);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        read_servo_feedback(&raw_fb, &mv_fb);
+
+        baseline_sum_progress += (mv_fb - prev_mv);
+        printf("  [Baseline %d/5 @ %3d deg] FB: %4d mV | Step Change: %+d mV\n", i + 1, next_ang, mv_fb, mv_fb - prev_mv);
+        prev_mv = mv_fb;
+        curr_ang = next_ang;
+    }
+
+    int dir_min = (baseline_sum_progress >= 0) ? 1 : -1;
+    ref_delta = abs(baseline_sum_progress) / 5;
+    if (ref_delta < 2) ref_delta = 2;
+    thresh = calculate_stop_threshold(ref_delta, Calibration_Sensitivity);
+
+    printf("  -> Polarity: %s | Avg Step: %d mV | Stop Thresh: <= %d mV\n",
+           (dir_min > 0) ? "Positive (+mV)" : "Negative (-mV)", ref_delta, thresh);
+    printf("6. Scanning for MIN limit...\n");
+
+    for (int ang = curr_ang - Calibration_Step_Size; ang >= 0; ang -= Calibration_Step_Size) {
+        set_servo_angle(ang);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        read_servo_feedback(&raw_fb, &mv_fb);
+
+        int progress = dir_min * (mv_fb - prev_mv);
+        printf("  [Angle %3d] FB: %4d mV | Forward Progress: %+2d mV\n", ang, mv_fb, progress);
+
+        if (progress <= thresh) {
+            int pre_stall_ang = ang + Calibration_Step_Size;
+            if (pre_stall_ang > SERVO_MAX_DEGREE) pre_stall_ang = SERVO_MAX_DEGREE;
+
+            printf("  -> Candidate stall detected at %d deg (Progress %+d <= Thresh %d).\n", ang, progress, thresh);
+            printf("  -> Verifying stall at %d deg by stepping back %d deg to %d deg (3 retries)...\n", 
+                   ang, Calibration_Step_Size, pre_stall_ang);
+
+            bool is_real_stall = true;
+
+            for (int retry = 1; retry <= 3; retry++) {
+                set_servo_angle(pre_stall_ang);
+                vTaskDelay(pdMS_TO_TICKS(350));
+                read_servo_feedback(&raw_fb, &mv_fb);
+                int pre_mv = mv_fb;
+
+                set_servo_angle(ang);
+                vTaskDelay(pdMS_TO_TICKS(350));
+                read_servo_feedback(&raw_fb, &mv_fb);
+
+                int retry_progress = dir_min * (mv_fb - pre_mv);
+                printf("     [Retry %d/3 @ %3d deg] Progress from %d deg: %+2d mV\n", retry, ang, pre_stall_ang, retry_progress);
+
+                if (retry_progress > thresh) {
+                    printf("     -> Motion restored! False alarm cleared.\n");
+                    is_real_stall = false;
+                    prev_mv = mv_fb;
+                    break;
+                }
+            }
+
+            if (is_real_stall) {
+                int final_limit = ang + Calibration_Backoff_Degrees;
+                if (final_limit > SERVO_MAX_DEGREE) final_limit = SERVO_MAX_DEGREE;
+
+                printf("  -> Hard limit confirmed at %d deg! Backing off %d deg to safe limit: %d deg.\n", 
+                       ang, Calibration_Backoff_Degrees, final_limit);
+                calib_min_angle = final_limit;
+                set_servo_angle(final_limit);
+                break;
+            }
+        } else {
+            prev_mv = mv_fb;
+        }
+
+        if (ang - Calibration_Step_Size < 0) {
+            calib_min_angle = 0;
+        }
+    }
+
+    set_servo_angle(135);
+    printf("\n--- Calibration Complete ---\n");
+    printf("Safe Operating Range: %d to %d degrees\n\n", calib_min_angle, calib_max_angle);
+
+    // Stop LED Flashing Red
+    g_led_state = LED_STATE_OFF;
+}
+
+// ============================================================================
+// 5. DEBOUNCED BUTTON TASK
+// ============================================================================
+static void button_task(void *pvParameters)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    bool is_pressed = false;
+    bool triggered = false;
+    TickType_t press_start_time = 0;
+    int last_printed_sec = 0;
+
+    static const int cycle_pcts[] = {0, 50, 100, 50};
+    static const int num_cycle_steps = sizeof(cycle_pcts) / sizeof(cycle_pcts[0]);
+    static int cycle_idx = 0;
+
+    while (1) {
+        if (gpio_get_level(BUTTON_GPIO) == 0) {
+            if (!is_pressed) {
+                vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+                if (gpio_get_level(BUTTON_GPIO) == 0) {
+                    is_pressed = true;
+                    triggered = false;
+                    press_start_time = xTaskGetTickCount();
+                    last_printed_sec = 0;
+
+                    // Light up Green while button is pressed (unless calibrating)
+                    if (g_led_state != LED_STATE_FLASH_RED) {
+                        g_led_state = LED_STATE_GREEN;
+                    }
+                }
+            } else if (!triggered) {
+                uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - press_start_time);
+                int elapsed_sec = elapsed_ms / 1000;
+
+                if (elapsed_sec > last_printed_sec && elapsed_sec < 5) {
+                    last_printed_sec = elapsed_sec;
+                    printf("[Button] Holding... %d/5 sec (Hold 5s to calibrate)\n", elapsed_sec);
+                }
+
+                if (elapsed_ms >= BUTTON_HOLD_TIME_MS) {
+                    triggered = true;
+                    printf("\n[Button] 5-second long press confirmed! Triggering calibration...\n");
+                    calibrate_servo();
+                }
+            }
+        } else {
+            if (is_pressed) {
+                vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+                if (gpio_get_level(BUTTON_GPIO) == 1) {
+                    // Turn off Green LED on button release
+                    if (g_led_state != LED_STATE_FLASH_RED) {
+                        g_led_state = LED_STATE_OFF;
+                    }
+
+                    if (!triggered) {
+                        int target_pct = cycle_pcts[cycle_idx];
+                        cycle_idx = (cycle_idx + 1) % num_cycle_steps;
+
+                        printf("\n[Button] Short press -> Moving to %d%%\n", target_pct);
+                        move_servo_percentage(target_pct);
+                    }
+                    is_pressed = false;
+                    triggered = false;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ============================================================================
+// 6. COMMAND PROCESSOR & MAIN LOOP
+// ============================================================================
+static void process_command(const char *cmd)
+{
+    if (strcasecmp(cmd, "Battery") == 0) {
+        float volts = read_battery_voltage();
+        printf("Battery Voltage: %.2f V\n", volts);
+    }
+    else if (strcasecmp(cmd, "Calibrate") == 0) {
+        calibrate_servo();
+    }
+    else if (strncasecmp(cmd, "Sensitivity", 11) == 0) {
+        const char *arg = cmd + 11;
+        while (*arg == ' ') arg++;
+
+        if (*arg != '\0') {
+            int val = atoi(arg);
+            if (val >= 1 && val <= 100) {
+                Calibration_Sensitivity = val;
+                printf("Calibration_Sensitivity set to %d\n", Calibration_Sensitivity);
+            } else {
+                printf("Error: Sensitivity must be between 1 and 100.\n");
+            }
+        } else {
+            printf("Current Calibration_Sensitivity: %d\n", Calibration_Sensitivity);
+        }
+    }
+    else if (strncasecmp(cmd, "StepSize", 8) == 0) {
+        const char *arg = cmd + 8;
+        while (*arg == ' ') arg++;
+
+        if (*arg != '\0') {
+            int val = atoi(arg);
+            if (val >= 1 && val <= 45) {
+                Calibration_Step_Size = val;
+                printf("Calibration_Step_Size set to %d degrees\n", Calibration_Step_Size);
+            } else {
+                printf("Error: StepSize must be between 1 and 45 degrees.\n");
+            }
+        } else {
+            printf("Current Calibration_Step_Size: %d degrees\n", Calibration_Step_Size);
+        }
+    }
+    else if (strncasecmp(cmd, "Backoff", 7) == 0) {
+        const char *arg = cmd + 7;
+        while (*arg == ' ') arg++;
+
+        if (*arg != '\0') {
+            int val = atoi(arg);
+            if (val >= 0 && val <= 45) {
+                Calibration_Backoff_Degrees = val;
+                printf("Calibration_Backoff_Degrees set to %d degrees\n", Calibration_Backoff_Degrees);
+            } else {
+                printf("Error: Backoff must be between 0 and 45 degrees.\n");
+            }
+        } else {
+            printf("Current Calibration_Backoff_Degrees: %d degrees\n", Calibration_Backoff_Degrees);
+        }
+    }
+    else if (strncasecmp(cmd, "Servo ", 6) == 0) {
+        const char *arg = cmd + 6;
+        while (*arg == ' ') arg++;
+
+        bool is_percentage = (strchr(arg, '%') != NULL);
+        int raw_val = atoi(arg);
+
+        if (is_percentage) {
+            move_servo_percentage(raw_val);
+        } else {
+            move_servo_degrees(raw_val);
+        }
+    }
+    else {
+        printf("Unknown command: '%s'. Available commands:\n", cmd);
+        printf("  'Battery', 'Servo <nnn|nnn%%>', 'Calibrate'\n");
+        printf("  'Sensitivity [1-100]', 'StepSize [1-45]', 'Backoff [0-45]'\n");
+    }
+}
+
+void app_main(void)
+{
+    adc_init();
+    rgb_led_init();
+    servo_init();
+    set_servo_angle(135);
+
+    // Spawn background tasks
+    xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+
+    printf("\n=== ESP32-H2 Interactive Controller Ready ===\n");
+    printf("Commands:\n");
+    printf("  1. 'Battery'             -> Returns battery voltage\n");
+    printf("  2. 'Servo nnn' or 'nnn%%' -> Sets servo angle in deg or relative %%\n");
+    printf("  3. 'Calibrate'           -> Runs auto calibration routine\n");
+    printf("  4. 'Sensitivity [1-100]' -> Gets or sets calibration sensitivity\n");
+    printf("  5. 'StepSize [1-45]'     -> Gets or sets calibration step size (deg)\n");
+    printf("  6. 'Backoff [0-45]'      -> Gets or sets safe backoff margin (deg)\n");
+    printf("  7. [BOOT Button]         -> Short press: cycles 0%% -> 50%% -> 100%% -> 50%% -> 0%%\n");
+    printf("                              Long press (5s): runs calibration (Flashing Red LED)\n\n");
+
+    static char line_buf[128];
+    static size_t line_pos = 0;
+
+    while (1) {
+        int c = getchar();
+
+        if (c != EOF) {
+            putchar(c);
+            fflush(stdout);
+
+            if (c == '\r' || c == '\n') {
+                printf("\n");
+                if (line_pos > 0) {
+                    line_buf[line_pos] = '\0';
+                    process_command(line_buf);
+                    line_pos = 0;
+                }
+            }
+            else if (c == '\b' || c == 127) {
+                if (line_pos > 0) line_pos--;
+            }
+            else if (line_pos < sizeof(line_buf) - 1) {
+                line_buf[line_pos++] = (char)c;
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+}

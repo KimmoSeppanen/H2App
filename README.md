@@ -6,7 +6,10 @@ ESP32-H2 firmware application for:
 - Battery voltage measurement through ADC and voltage divider
 - Runtime servo calibration with hard-limit detection
 - BOOT button short-press and long-press actions
+- Onboard RGB status LED indication
 - UART console command interface
+
+Target hardware board: Olimex ESP32-H2-Dev-Lipo.
 
 Main implementation is in [main/main.c](main/main.c).
 
@@ -23,15 +26,23 @@ Main implementation is in [main/main.c](main/main.c).
 - BOOT button handling:
 	- Short press cycles servo target: `0% -> 50% -> 100% -> 50% -> ...`
 	- Long press (5 seconds) triggers calibration
+- RGB LED status handling:
+	- Button pressed: solid green
+	- Calibration running: flashing red
 
 ## Hardware Mapping
 
+The GPIO/ADC mapping in this project is defined for the Olimex ESP32-H2-Dev-Lipo board wiring used by this application.
+
 - BOOT button input: `GPIO9`
+- RGB status LED data: `GPIO8`
 - Servo PWM output: `GPIO3`
 - Servo feedback ADC: `ADC1 CH3` (GPIO4)
 - Battery ADC: `ADC1 CH1` (GPIO2)
 
 Current ADC attenuation is `12 dB` for both channels.
+
+When adding new functionality, keep board constraints in mind (available pins, onboard peripherals, and shared resources).
 
 ## Build Prerequisites
 
@@ -110,3 +121,9 @@ Exit monitor with `Ctrl+]`.
 For detailed architecture and algorithm-level documentation, see:
 
 - [docs/application_documentation.md](docs/application_documentation.md)
+
+## Changelog And Versioning
+
+- Project changelog: [CHANGELOG.md](CHANGELOG.md)
+- Firmware version is defined in `main/main.c` as `APP_VERSION`.
+- Device prints the firmware version to serial during boot.
