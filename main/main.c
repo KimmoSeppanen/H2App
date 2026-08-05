@@ -12,14 +12,15 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "matter_bridge.h"
 
 static const char *TAG __attribute__((unused)) = "MAIN_APP";
 
-#define APP_VERSION             "0.5.0"
+#define APP_VERSION             "0.6.0"
 
-#define CHANGELOG_LATEST_1      "0.5.0: Startup now prints last 3 changelog entries"
-#define CHANGELOG_LATEST_2      "0.4.0: Olimex LED control fixed (GPIO8 active LOW)"
-#define CHANGELOG_LATEST_3      "0.3.0: Added button/calibration status LED behavior"
+#define CHANGELOG_LATEST_1      "0.6.0: Matter runtime integrated (Phase A plumbing)"
+#define CHANGELOG_LATEST_2      "0.5.0: Startup now prints last 3 changelog entries"
+#define CHANGELOG_LATEST_3      "0.4.0: Olimex LED control fixed (GPIO8 active LOW)"
 
 // ============================================================================
 // 1. HARDWARE PINS & ADC CONFIGURATION
@@ -665,6 +666,8 @@ static void process_command(const char *cmd)
 
 void app_main(void)
 {
+    esp_err_t matter_err = ESP_OK;
+
     adc_init();
     status_led_init();
     servo_init();
@@ -674,11 +677,19 @@ void app_main(void)
     xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
 
+    // Phase A: initialize Matter runtime (no endpoint control hooks yet)
+    matter_err = matter_bridge_init();
+
     printf("\n=== ESP32-H2 Interactive Controller v%s ===\n", APP_VERSION);
     printf("Recent changes:\n");
     printf("  - %s\n", CHANGELOG_LATEST_1);
     printf("  - %s\n", CHANGELOG_LATEST_2);
     printf("  - %s\n", CHANGELOG_LATEST_3);
+    if (matter_err == ESP_OK) {
+        printf("Matter: initialized (Phase A runtime active)\n");
+    } else {
+        printf("Matter: init failed (%s)\n", esp_err_to_name(matter_err));
+    }
     printf("Commands:\n");
     printf("  1. 'Battery'             -> Returns battery voltage\n");
     printf("  2. 'Servo nnn' or 'nnn%%' -> Sets servo angle in deg or relative %%\n");

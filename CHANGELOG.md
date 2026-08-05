@@ -14,6 +14,18 @@ When making changes in future:
 4. Summarize Added, Changed, and Fixed items.
 5. Keep entries short and operator-focused.
 
+## [0.6.0] - 2026-08-05
+
+### Added
+
+- Added Phase A Matter bridge module and startup initialization path.
+- Added serial boot status line showing Matter runtime init result.
+
+### Changed
+
+- Main component now builds mixed C/C++ sources and links ESP-Matter dependencies.
+- Versioned startup release highlights updated for Phase A Matter integration.
+
 ## [0.5.0] - 2026-08-05
 
 ### Added
