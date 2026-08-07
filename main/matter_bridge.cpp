@@ -5,9 +5,25 @@
 
 #include <esp_matter.h>
 
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+#include "esp_openthread_types.h"
+#include <platform/ESP32/OpenthreadLauncher.h>
+#endif
+
 static const char *TAG = "MATTER_BRIDGE";
 
 using namespace esp_matter;
+
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+#define ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG() \
+    { .radio_mode = RADIO_MODE_NATIVE, }
+
+#define ESP_OPENTHREAD_DEFAULT_HOST_CONFIG() \
+    { .host_connection_mode = HOST_CONNECTION_MODE_NONE, }
+
+#define ESP_OPENTHREAD_DEFAULT_PORT_CONFIG() \
+    { .storage_partition_name = "nvs", .netif_queue_size = 10, .task_queue_size = 10, }
+#endif
 
 static void matter_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
@@ -82,6 +98,19 @@ esp_err_t matter_bridge_init(void)
         ESP_LOGE(TAG, "Failed to create Matter node");
         return ESP_FAIL;
     }
+
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+    esp_openthread_platform_config_t ot_platform_config = {
+        .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
+        .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
+        .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
+    };
+    err = set_openthread_platform_config(&ot_platform_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set OpenThread platform config: %s", esp_err_to_name(err));
+        return err;
+    }
+#endif
 
     err = esp_matter::start(matter_event_cb);
     if (err != ESP_OK) {
