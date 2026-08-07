@@ -16,11 +16,11 @@
 
 static const char *TAG __attribute__((unused)) = "MAIN_APP";
 
-#define APP_VERSION             "0.6.0"
+#define APP_VERSION             "0.7.0"
 
-#define CHANGELOG_LATEST_1      "0.6.0: Matter runtime integrated (Phase A plumbing)"
-#define CHANGELOG_LATEST_2      "0.5.0: Startup now prints last 3 changelog entries"
-#define CHANGELOG_LATEST_3      "0.4.0: Olimex LED control fixed (GPIO8 active LOW)"
+#define CHANGELOG_LATEST_1      "0.7.0: Active-LOW servo power gate tied to movement"
+#define CHANGELOG_LATEST_2      "0.6.0: Matter runtime integrated (Phase A plumbing)"
+#define CHANGELOG_LATEST_3      "0.5.0: Startup now prints last 3 changelog entries"
 
 // ============================================================================
 // 1. HARDWARE PINS & ADC CONFIGURATION
@@ -182,11 +182,17 @@ static void led_task(void *pvParameters)
 // 3. SERVO PWM CONFIGURATION & MOVEMENT HELPERS
 // ============================================================================
 #define SERVO_GPIO              GPIO_NUM_3
+#define SERVO_POWER_EN_GPIO     GPIO_NUM_10
+#define SERVO_POWER_ACTIVE_LEVEL 0                 // Active LOW: 0 enables servo power
+#define SERVO_POWER_IDLE_LEVEL   1
 #define SERVO_LEDC_SPEED_MODE   LEDC_LOW_SPEED_MODE
 #define SERVO_LEDC_CHANNEL      LEDC_CHANNEL_0
 #define SERVO_LEDC_TIMER        LEDC_TIMER_0
 #define SERVO_LEDC_DUTY_RES     LEDC_TIMER_14_BIT
 #define SERVO_LEDC_FREQ_HZ      50
+
+#define SERVO_POWER_STABILIZE_MS 50
+#define SERVO_MOVE_SETTLE_MS     600
 
 #define SERVO_MIN_PULSE_WIDTH_US 500
 #define SERVO_MAX_PULSE_WIDTH_US 2500
@@ -198,6 +204,38 @@ static int Calibration_Backoff_Degrees = 5;   // Safe margin backed off after st
 
 static int calib_min_angle = 0;
 static int calib_max_angle = SERVO_MAX_DEGREE;
+static bool g_servo_power_enabled = false;
+
+static void servo_power_init(void)
+{
+    gpio_config_t pwr_conf = {
+        .pin_bit_mask = (1ULL << SERVO_POWER_EN_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&pwr_conf));
+    ESP_ERROR_CHECK(gpio_set_level(SERVO_POWER_EN_GPIO, SERVO_POWER_IDLE_LEVEL));
+    g_servo_power_enabled = false;
+}
+
+static void servo_power_enable(void)
+{
+    if (!g_servo_power_enabled) {
+        ESP_ERROR_CHECK(gpio_set_level(SERVO_POWER_EN_GPIO, SERVO_POWER_ACTIVE_LEVEL));
+        vTaskDelay(pdMS_TO_TICKS(SERVO_POWER_STABILIZE_MS));
+        g_servo_power_enabled = true;
+    }
+}
+
+static void servo_power_disable(void)
+{
+    if (g_servo_power_enabled) {
+        ESP_ERROR_CHECK(gpio_set_level(SERVO_POWER_EN_GPIO, SERVO_POWER_IDLE_LEVEL));
+        g_servo_power_enabled = false;
+    }
+}
 
 static void servo_init(void)
 {
@@ -243,11 +281,13 @@ static void move_servo_degrees(int target_angle)
     if (clamped_angle < calib_min_angle) clamped_angle = calib_min_angle;
     if (clamped_angle > calib_max_angle) clamped_angle = calib_max_angle;
 
+    servo_power_enable();
     set_servo_angle(target_angle);
-    vTaskDelay(pdMS_TO_TICKS(600));
+    vTaskDelay(pdMS_TO_TICKS(SERVO_MOVE_SETTLE_MS));
 
     int raw_fb, mv_fb;
     read_servo_feedback(&raw_fb, &mv_fb);
+    servo_power_disable();
 
     if (target_angle != clamped_angle) {
         printf("Warning: Target %d deg clamped to safe limit %d deg.\n", target_angle, clamped_angle);
@@ -263,11 +303,13 @@ static void move_servo_percentage(int pct)
     float span = (float)(calib_max_angle - calib_min_angle);
     int clamped_angle = (int)(calib_min_angle + roundf((pct / 100.0f) * span));
 
+    servo_power_enable();
     set_servo_angle(clamped_angle);
-    vTaskDelay(pdMS_TO_TICKS(600));
+    vTaskDelay(pdMS_TO_TICKS(SERVO_MOVE_SETTLE_MS));
 
     int raw_fb, mv_fb;
     read_servo_feedback(&raw_fb, &mv_fb);
+    servo_power_disable();
 
     printf("Servo turned to %d%% (%d deg) [Limits: %d..%d deg] | Feedback: %d mV (ADC Raw: %d)\n",
            pct, clamped_angle, calib_min_angle, calib_max_angle, mv_fb, raw_fb);
@@ -294,6 +336,7 @@ static void calibrate_servo(void)
 
     g_calibration_active = true;
     g_led_state = LED_STATE_FLASH_RED;
+    servo_power_enable();
 
     printf("\n--- Starting Servo Calibration ---\n");
     printf("Config: Sensitivity = %d/100 | Step Size = %d deg | Backoff Margin = %d deg\n", 
@@ -491,6 +534,7 @@ static void calibrate_servo(void)
     set_servo_angle(135);
     printf("\n--- Calibration Complete ---\n");
     printf("Safe Operating Range: %d to %d degrees\n\n", calib_min_angle, calib_max_angle);
+    servo_power_disable();
 
     g_calibration_active = false;
     g_led_state = LED_STATE_OFF;
@@ -670,8 +714,12 @@ void app_main(void)
 
     adc_init();
     status_led_init();
+    servo_power_init();
     servo_init();
+    servo_power_enable();
     set_servo_angle(135);
+    vTaskDelay(pdMS_TO_TICKS(SERVO_MOVE_SETTLE_MS));
+    servo_power_disable();
 
     // Spawn background tasks
     xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);

@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 This project follows Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
+## [0.7.0] - 2026-08-07
+
+### Added
+
+- Added dedicated servo power-enable control pin on GPIO10 (active LOW).
+- Added servo power gating sequence: enable power, wait 50 ms for rail stabilization, then allow servo movement.
+
+### Changed
+
+- Updated servo movement paths to automatically disable servo power after movement settles.
+- Calibration flow now keeps servo power enabled for the full calibration routine and disables it when complete.
+
 ## How To Update
 
 When making changes in future:
